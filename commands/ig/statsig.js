@@ -31,13 +31,13 @@ module.exports.run = async(client, message, args) => {
                 inline: true
             },
             {
-                name: "Première connexion",
-                value: String("<t:" + result.firstjoin + ":R> (<t:" + result.firstjoin + ":F>)"),
+                name: "Faction",
+                value: (await getFaction(client.mysqlingame, username) ?? "Aucune"),
                 inline: true
             },
             {
-                name: "Temps de jeu",
-                value: `${timeig.hour} heures, ${timeig.minute} et ${timeig.second} secondes`,
+                name: "Grade",
+                value: `GRADE`, //value a modifier, je connais pas la value du grade d'un joueur
                 inline: true
             },
             {
@@ -46,10 +46,15 @@ module.exports.run = async(client, message, args) => {
                 inline: true
             },
             {
-                name: "Faction",
-                value: (await getFaction(client.mysqlingame, username) ?? "Aucune"),
+                name: "Première connexion",
+                value: String("<t:" + result.firstjoin + ":R> (<t:" + result.firstjoin + ":F>)"),
                 inline: true
             },
+            {
+                name: "Temps de jeu",
+                value: `${timeig.hour} heures, ${timeig.minute} et ${timeig.second} secondes`,
+                inline: true
+             },
         ];
         if (result.online === "offline") {
             fields.push(
