@@ -31,6 +31,7 @@ module.exports.run = async(client, message, args) => {
 	    case "event2": port = 18002; break;
 	    case "nico1pm5": port = 19603; break;
 	    case "ailfepm5": port = 19604; break;
+        case "farmzone": port = 18000; break;
 
 	    case "all": port = "all"; break;
 
@@ -45,7 +46,7 @@ module.exports.run = async(client, message, args) => {
         return;
     }
     if(port === "all"){
-        [19001, 19002, 19003, 19004, 19005, 19101, 19102, /*19103,*/ 19201, 19202, 19203, 19204, 19501, 19502, 18001, 18002, 19603, 19604]
+        [19001, 19002, 19003, 19004, 19005, 19101, 19102, /*19103,*/ 19201, 19202, 19203, 19204, 19501, 19502, 18000, 18001, 18002, 19603, 19604]
             .forEach(element => setTimeout(function(){rconfunc(element, reason, message, element)}, 5500));
         return;
     }
