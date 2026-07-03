@@ -14,6 +14,10 @@ module.exports.run = async(client, message, args) => {
             for(const emote of [config.idees.emoteYes, config.idees.emoteNo]){
                 await msgidee.react(emote);
             }
+            await msgidee.startThread({
+                name: 'idée de ' + message.author.username,
+                autoArchiveDuration: 1440
+            }).catch(err => console.error("Impossible de créer le thread pour l'idée :", err));
         })
 };
 
