@@ -8,13 +8,25 @@ module.exports.run = async(client, message, args) => {
     if (desac) return message.channel.send("Les tickets sont temporairement désactivés probablement dû à une surcharge. Veuillez nous en excuser.");
     if (message.guild.id !== config.serverId) return message.channel.send("Pas de ticket sur ce serveur");
 
+    let target = message.member;
+    if (args[0]) {
+        if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
+            return message.reply("Vous n'avez pas la permission d'ouvrir un ticket pour quelqu'un d'autre");
+        }
+        let targetId = message.mentions.members?.first()?.id || (args[0].match(/^\d+$/) ? args[0] : null);
+        if (!targetId) return message.reply("Merci de mentionner un utilisateur ou de donner son ID (ex: `+ticket @Utilisateur` ou `+ticket 123456789012345678`)");
+        target = message.guild.members.cache.get(targetId) || await message.guild.members.fetch(targetId).catch(() => null);
+        if (!target) return message.reply("Cet utilisateur doit être présent sur le serveur pour lui ouvrir un ticket");
+    }
+    let openedForSomeoneElse = target.id !== message.author.id;
+
     message.guild.channels.create({
-        name: message.author.username,
+        name: target.user.username,
         type: ChannelType.GuildText,
-        topic: 'Ticket en attente de <@' + message.member.id+'>',
+        topic: 'Ticket en attente de <@' + target.id+'>',
         permissionOverwrites: [
             {
-                id: message.member.id,
+                id: target.id,
                 allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks]
             },
             {
@@ -26,7 +38,7 @@ module.exports.run = async(client, message, args) => {
                 allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks]
             }
         ],
-        parent: config.tickets.categoryWait, reason: 'Ticket de ' + message.author.tag
+        parent: config.tickets.categoryWait, reason: 'Ticket de ' + target.user.tag + (openedForSomeoneElse ? ' ouvert par ' + message.author.tag : '')
     }).then(async c => {
         if (!c || !c instanceof TextChannel) return message.reply("Désolé, il y'a une erreur quelque part");
         let reasons;
@@ -35,8 +47,12 @@ module.exports.run = async(client, message, args) => {
             if (!reasons) reasons = "**Veuillez réagir avec un émoji en dessous du message concernant votre demande**\n" + key + " " + value;
             else reasons = reasons.concat("\n" + key + " " + value);
         }
-        client.log(`Le ticket <#${c.id}> a été ouvert par ${message.author.tag}`, 'gen');
-        message.reply(`:white_check_mark: Votre Ticket a été créé, <#${c.id}>`); //Send msg in channel of opening
+        client.log(openedForSomeoneElse
+            ? `Le ticket <#${c.id}> a été ouvert pour ${target.user.tag} par ${message.author.tag}`
+            : `Le ticket <#${c.id}> a été ouvert par ${message.author.tag}`, 'gen');
+        message.reply(openedForSomeoneElse
+            ? `:white_check_mark: Le ticket a été créé pour ${target.user.tag}, <#${c.id}>`
+            : `:white_check_mark: Votre Ticket a été créé, <#${c.id}>`); //Send msg in channel of opening
 
         let options = [];
         for (const [key, value] of Object.entries(config.tickets.reasons)) { //Generate list of options
@@ -80,25 +96,25 @@ module.exports.run = async(client, message, args) => {
             await interaction.deferUpdate();
 
             let link = client.commands.get("link");
-            let username = await link.getFromDiscordId(client.mysqlingame, message.author.id);
+            let username = await link.getFromDiscordId(client.mysqlingame, target.id);
             let subject = config.tickets.reasons[interaction.values[0]];
 
             if (!username) {
-                await reason(client, newmsg, subject, message.author);
+                await reason(client, newmsg, subject, target.user);
             } else {
-                await pseudo(client, newmsg, username.player, subject, message.author);
+                await pseudo(client, newmsg, username.player, subject, target.user);
             }
         });
         collector.on('end', () => {
             if(!newmsg.channel) return;
             if(config.tickets.categoryWait !== newmsg.channel.parent.id) return collector.stop();
             if(collector.collected.size === 0){
-                console.log("Ticket of " + message.author.tag + " timeout on open");
+                console.log("Ticket of " + target.user.tag + " timeout on open");
                 newmsg.channel.send("Absence de plus de 5 minutes, fermeture du ticket dans 5 secondes." +
                     "\nVeuillez réessayer d'ouvrir un ticket et n'oubliez pas de définir le sujet du ticket.");
                 require("../../sleep.js")(5000);
                 newmsg.channel.delete();
-                message.author.send("Nous n'avons pas eu de réponse dans votre ticket depuis 5 minutes que vous n'avez pas finir d'ouvrir, le ticket a été fermé."+
+                target.user.send("Nous n'avons pas eu de réponse dans votre ticket depuis 5 minutes que vous n'avez pas finir d'ouvrir, le ticket a été fermé."+
                     "\nVeuillez réessayer d'ouvrir un ticket et n'oubliez pas de définir le sujet du ticket.");
             }
         });
@@ -252,8 +268,8 @@ async function description(message, reason, pseudo, description, author){
 
 module.exports.config = {
     name: "new",
-    description: "Ouvrir un ticket",
-    format: "new",
+    description: "Ouvrir un ticket (le staff peut l'ouvrir pour un joueur via +ticket {ID/@})",
+    format: "new [ID/@utilisateur]",
     canBeUseByBot: false,
     alias: ["ticket"],
     category: "Ticket"
