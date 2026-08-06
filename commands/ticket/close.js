@@ -216,10 +216,8 @@ async function createTranscript(message, transcriptname, client) { //Tests
     script.append(vue);
     body.appendChild(script);
 
-    await fs.writeFileSync('/tmp/' + transcriptname + '.html', document.documentElement.outerHTML); //Enregistrer l'entête du serveur
-    //Send tmp file through rsync to the server
-    let result = await shell.exec('rsync /tmp/' + transcriptname + '.html root@192.168.1.103:/var/www/transcripts.histeria.fr/', {silent:true}).stdout;
-    await fs.unlinkSync('/tmp/' + transcriptname + '.html');
+    //write to a shared folder /transcripts with the ct web
+    await fs.writeFileSync('/transcripts/' + transcriptname + '.html', document.documentElement.outerHTML);
 }
 function replaceescape(content)
 {
