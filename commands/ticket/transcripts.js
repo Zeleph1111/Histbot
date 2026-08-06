@@ -41,7 +41,7 @@ function buildPayload(message, results, page, totalPages, mentionId)
     // qui pourrait être undefined -> fix du bug "Transcripts de <@undefined>"
     let who;
     if(message.author.id === mentionId) who = 'Vos transcripts';
-    else who = 'Transcripts de <@'+mentionId+'> ('+results[0].name+')';
+    else who = 'Transcripts de <@' + mentionId + '> (' + results[0].username + ')';
 
     let start = page * PAGE_SIZE;
     let pageResults = results.slice(start, start + PAGE_SIZE);
@@ -61,7 +61,7 @@ function buildPayload(message, results, page, totalPages, mentionId)
             fields: [
                 {
                     name: who,
-                    value: content
+                    value: content.length > 1024 ? content.slice(0, 1021) + '...' : content
                 }
             ],
         }]

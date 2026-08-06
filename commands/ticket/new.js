@@ -40,7 +40,7 @@ module.exports.run = async(client, message, args) => {
         ],
         parent: config.tickets.categoryWait, reason: 'Ticket de ' + target.user.tag + (openedForSomeoneElse ? ' ouvert par ' + message.author.tag : '')
     }).then(async c => {
-        if (!c || !c instanceof TextChannel) return message.reply("Désolé, il y'a une erreur quelque part");
+        if (!c || !(c instanceof TextChannel)) return message.reply("Désolé, il y'a une erreur quelque part");
         let reasons;
 
         for (const [key, value] of Object.entries(config.tickets.reasons)) {
