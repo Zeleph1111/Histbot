@@ -164,6 +164,20 @@ async function linkedPlayer(client, userId) {
     return rows && rows[0] ? rows[0].player : null;
 }
 
+//discord_link has `player` for primary key and no index on `discord`, so every
+//WHERE discord = ? is a full table scan. A pass used to ask for one per registered member.
+//Reading the column once costs exactly one scan and answers all of them.
+async function loadLinks(client) {
+    let rows = await query(client.mysqlingame, "SELECT `discord`, `player` FROM `discord_link`");
+    let links = new Map();
+    if (rows) {
+        //Nothing forbids two rows for one discord id; keep the first, like linkedPlayer does,
+        //and treat an empty name as no link, like linkedPlayer's caller does
+        for (const row of rows) if (row.player && !links.has(row.discord)) links.set(row.discord, row.player);
+    }
+    return links;
+}
+
 //A player with no ranks row sits on the default rank, he is not an unknown player
 async function inGameRank(client, player) {
     let rows = await query(client.mysqlingame, "SELECT `rank` FROM `ranks` WHERE `player` = ?", [player]);
@@ -295,7 +309,7 @@ async function grantBooster(client, member, options = {}) {
     let conf = boosterConf();
     if (!boosterEnabled()) return "disabled";
 
-    let player = await linkedPlayer(client, member.id);
+    let player = options.player !== undefined ? options.player : await linkedPlayer(client, member.id);
     if (!player) {
         if (options.notify) {
             notifyOnce(member, "Merci pour ton boost !\nPour recevoir le grade " + conf.rank + " en jeu, il faut d'abord relier ton compte : tape `/link` en jeu, puis `"
@@ -361,11 +375,11 @@ async function grantBooster(client, member, options = {}) {
 
 //Sliding window. Re-running temprank with the same rank ADDS the remaining time instead of
 //replacing it, so a renewal has to be an absolute write.
-async function renewBooster(client, row) {
+async function renewBooster(client, row, known) {
     let conf = boosterConf();
     if (!boosterConfigured()) return "not-configured";
 
-    let player = await linkedPlayer(client, row.user);
+    let player = known !== undefined ? known : await linkedPlayer(client, row.user);
     if (!player) player = row.player;
 
     let expire = nowSeconds() + conf.days * DAY;
@@ -389,13 +403,16 @@ async function renewBooster(client, row) {
     return "renewed";
 }
 
-//Single entry point: renews what exists, grants what does not
+//Single entry point: renews what exists, grants what does not.
+//options.row and options.player let the reconciliation pass hand over what it already read,
+//instead of asking again once per member. Undefined means "not handed over", null means
+//"handed over, and there is none".
 async function ensureBooster(client, member, options = {}) {
     if (!boosterEnabled()) return "disabled";
 
-    let row = await boosterRow(client, member.id);
+    let row = options.row !== undefined ? options.row : await boosterRow(client, member.id);
     if (row) {
-        let outcome = await renewBooster(client, row);
+        let outcome = await renewBooster(client, row, options.player);
         if (outcome !== "regrant") return outcome;
     }
     return grantBooster(client, member, options);
@@ -488,19 +505,28 @@ async function sweep(client) {
         return console.error("Passe de reconciliation : impossible de recuperer les membres : " + err);
     }
 
-    await quiet(sweepRoles(client), "Passe de reconciliation des roles");
-    await quiet(sweepBoosters(client, members), "Passe de reconciliation des boosters");
+    //One read of the link table for the whole pass, instead of one per registered member.
+    //It is only a shortcut: both destructive branches confirm live before acting, so losing
+    //it costs speed, never correctness, and must not cancel the pass.
+    let links = await quiet(loadLinks(client), "Passe de reconciliation : lecture des liaisons");
+    if (!links) links = new Map();
+
+    await quiet(sweepRoles(client, links), "Passe de reconciliation des roles");
+    await quiet(sweepBoosters(client, members, links), "Passe de reconciliation des boosters");
 }
 
 //Only touches roles the bot recorded posting itself, so a rank offered by hand is safe
-async function sweepRoles(client) {
+async function sweepRoles(client, links) {
     let rows = await query(client.mysqldiscord, "SELECT DISTINCT `user` FROM `rankRoleGrant`");
     if (!rows) return;
 
     for (const row of rows) {
         try {
-            let player = await linkedPlayer(client, row.user);
-            if (player) continue;
+            if (links.has(row.user)) continue;
+            //The snapshot is a few seconds old and what follows takes roles away, so the
+            //rare member it points at is confirmed live first. Costs one query per member
+            //actually concerned, not one per member in the register.
+            if (await linkedPlayer(client, row.user)) continue;
 
             let granted = await grantedRoles(client, row.user);
             let roles = await removeRoles(client, row.user, granted, "Compte de jeu delie");
@@ -519,28 +545,31 @@ async function sweepRoles(client) {
 
 //Sequential on purpose: MiniCore reads temp_rank before writing it, outside its own
 //callback, so two concurrent rank commands on the same player race each other.
-async function sweepBoosters(client, members) {
+async function sweepBoosters(client, members, links) {
     let rows = await query(client.mysqldiscord, "SELECT * FROM `boosterRank`");
-    if (rows) {
-        for (const row of rows) {
-            try {
-                let member = members.get(row.user);
-                if (!member) {
-                    await revokeBooster(client, row.user, "Membre parti du serveur");
-                    continue;
-                }
-                if (!member.premiumSince) {
-                    await revokeBooster(client, row.user, "Fin du boost");
-                    continue;
-                }
-                //Still boosting is not enough. The account may have unlinked in game, which
-                //the bot is never told about, and the sibling pass above has already taken
-                //his discord roles back for exactly that reason.
-                let player = await linkedPlayer(client, row.user);
-                if (!player) await revokeBooster(client, row.user, "Compte de jeu delie");
-            } catch (err) {
-                console.error("Retrait du grade booster de " + row.user + " : " + err);
-            }
+
+    //The whole table, so an absent key means "no grant", not "not looked up yet"
+    let granted = new Map();
+    if (rows) for (const row of rows) granted.set(row.user, row);
+
+    for (const row of rows || []) {
+        try {
+            let member = members.get(row.user);
+            let reason = null;
+
+            if (!member) reason = "Membre parti du serveur";
+            else if (!member.premiumSince) reason = "Fin du boost";
+            //Still boosting is not enough. The account may have unlinked in game, which the
+            //bot is never told about, and the sibling pass above has already taken his
+            //discord roles back for exactly that reason.
+            //Same as above: confirmed live, because this one takes a rank away
+            else if (!links.has(row.user) && !await linkedPlayer(client, row.user)) reason = "Compte de jeu delie";
+
+            if (!reason) continue;
+            await revokeBooster(client, row.user, reason);
+            granted.delete(row.user);
+        } catch (err) {
+            console.error("Retrait du grade booster de " + row.user + " : " + err);
         }
     }
 
@@ -549,7 +578,11 @@ async function sweepBoosters(client, members) {
     for (const member of members.values()) {
         if (!member.premiumSince) continue;
         try {
-            await ensureBooster(client, member, {notify: false});
+            await ensureBooster(client, member, {
+                notify: false,
+                row: granted.has(member.id) ? granted.get(member.id) : null,
+                player: links.has(member.id) ? links.get(member.id) : null
+            });
         } catch (err) {
             console.error("Grade booster pour " + member.id + " : " + err);
         }
