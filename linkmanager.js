@@ -216,28 +216,39 @@ async function grantedRoles(client, userId) {
     return rows ? rows.map(row => row.role) : [];
 }
 
-async function forgetRoles(client, userId) {
-    await query(client.mysqldiscord, "DELETE FROM `rankRoleGrant` WHERE `user` = ?", [userId]);
+//`keep` holds the roles whose removal just failed: their register rows stay so the next
+//pass tries again, instead of forgetting a role that is still on the member.
+async function forgetRoles(client, userId, keep = []) {
+    if (!keep.length) {
+        await query(client.mysqldiscord, "DELETE FROM `rankRoleGrant` WHERE `user` = ?", [userId]);
+        return;
+    }
+    let holes = keep.map(() => "?").join(", ");
+    await query(client.mysqldiscord,
+        "DELETE FROM `rankRoleGrant` WHERE `user` = ? AND `role` NOT IN (" + holes + ")", [userId].concat(keep));
 }
 
 //Always resolves the member on the main server: +link is usable from the staff server and
 //from any other guild the bot sits in, where message.member would be the wrong member.
+//Reports what failed, because forgetting a role that is still worn strands it for good.
 async function removeRoles(client, userId, roleIds, reason) {
     let member = await mainMember(client, userId);
-    if (!member) return [];
+    if (!member) return {removed: [], failed: []};
 
     let removed = [];
+    let failed = [];
     for (const roleId of roleIds) {
         if (!roleId || !member.roles.cache.has(roleId)) continue;
         try {
             await member.roles.remove(roleId, reason);
             removed.push(roleId);
         } catch (err) {
+            failed.push(roleId);
             console.error("Retrait du role " + roleId + " impossible pour " + userId + " : " + err);
             log(client, "Impossible de retirer le role " + roleId + " a <@" + userId + "> : " + err);
         }
     }
-    return removed;
+    return {removed: removed, failed: failed};
 }
 
 /* ------------------------------------------------------------------ *
@@ -247,17 +258,17 @@ async function removeRoles(client, userId, roleIds, reason) {
 //Called from +link remove, where the account really was linked a second ago. The five
 //config.ranks roles all come from the link, so all five go.
 async function onUnlink(client, userId) {
-    let removed = await removeRoles(client, userId, rankRoleIds(), "Compte de jeu delie");
-    await quiet(forgetRoles(client, userId), "Nettoyage du registre de roles de " + userId);
+    let roles = await removeRoles(client, userId, rankRoleIds(), "Compte de jeu delie");
+    await quiet(forgetRoles(client, userId, roles.failed), "Nettoyage du registre de roles de " + userId);
     await quiet(query(client.mysqldiscord, "DELETE FROM `tempRank` WHERE `user` = ?", [userId]),
         "Nettoyage de tempRank pour " + userId);
 
     let booster = await quiet(revokeBooster(client, userId, "Compte de jeu delie"), "Retrait du grade booster de " + userId);
 
-    if (removed.length) {
-        log(client, "<@" + userId + "> s'est delie, " + removed.length + " role(s) de grade retire(s)");
+    if (roles.removed.length) {
+        log(client, "<@" + userId + "> s'est delie, " + roles.removed.length + " role(s) de grade retire(s)");
     }
-    return {roles: removed, booster: booster};
+    return {roles: roles.removed, failed: roles.failed, booster: booster};
 }
 
 /* ------------------------------------------------------------------ *
@@ -364,6 +375,11 @@ async function renewBooster(client, row) {
     //Row gone (already expired and consumed at a login, wiped by datam) or replaced by
     //another temporary rank: our bookkeeping is stale, drop it and let the caller retry.
     if (!result || result.affectedRows === 0) {
+        //The discord account may have moved to another minecraft name. Our row is then still
+        //standing on the old one, and MiniCore reads it as an order to demote that account at
+        //its next login, which would wipe anything bought since. Undo it before letting go.
+        if (player !== row.player) await releaseTempRank(client, row.player, row.old_rank || defaultRank());
+
         await query(client.mysqldiscord, "DELETE FROM `boosterRank` WHERE `user` = ?", [row.user]);
         return "regrant";
     }
@@ -385,6 +401,32 @@ async function ensureBooster(client, member, options = {}) {
     return grantBooster(client, member, options);
 }
 
+//Undoes our own temporary rank on one minecraft account. Shared by the revoke path and by
+//the renewal that discovers its account changed.
+async function releaseTempRank(client, player, back) {
+    let conf = boosterConf();
+    let current = await inGameRank(client, player);
+
+    if (current !== conf.rank) {
+        //Someone else moved his rank in the meantime. Leave it alone, but drop our row so
+        //MiniCore does not undo their change at the next login.
+        await query(client.mysqlingame, "DELETE FROM `temp_rank` WHERE `player` = ? AND `new` = ?", [player, conf.rank]);
+        return "superseded";
+    }
+
+    //Safety net first: an expired row makes MiniCore itself restore the rank at the next
+    //login, whatever happens to the RCON call below.
+    await query(client.mysqlingame, "UPDATE `temp_rank` SET `expire` = ? WHERE `player` = ? AND `new` = ?",
+        [nowSeconds() - 1, player, conf.rank]);
+
+    let result = await rconFirst(client, "setrank " + player + " " + back);
+    if (!result) return "deferred";
+
+    await query(client.mysqlingame, "DELETE FROM `temp_rank` WHERE `player` = ? AND `new` = ?", [player, conf.rank]);
+    await rconBroadcast(client, "setrank " + player + " " + back, result.port);
+    return "restored";
+}
+
 //Reads what the bot posted itself, never the rank the player is wearing
 async function revokeBooster(client, userId, reason) {
     let conf = boosterConf();
@@ -393,33 +435,10 @@ async function revokeBooster(client, userId, reason) {
     let row = await boosterRow(client, userId);
     if (!row) return "nothing";
 
-    let player = await linkedPlayer(client, userId);
-    if (!player) player = row.player;
-
-    let current = await inGameRank(client, player);
-    let back = row.old_rank || defaultRank();
-    let outcome;
-
-    if (current === conf.rank) {
-        //Safety net first: an expired row makes MiniCore itself restore the rank at the next
-        //login, whatever happens to the RCON call below.
-        await query(client.mysqlingame, "UPDATE `temp_rank` SET `expire` = ? WHERE `player` = ? AND `new` = ?",
-            [nowSeconds() - 1, player, conf.rank]);
-
-        let result = await rconFirst(client, "setrank " + player + " " + back);
-        if (result) {
-            await query(client.mysqlingame, "DELETE FROM `temp_rank` WHERE `player` = ? AND `new` = ?", [player, conf.rank]);
-            await rconBroadcast(client, "setrank " + player + " " + back, result.port);
-            outcome = "restored";
-        } else {
-            outcome = "deferred";
-        }
-    } else {
-        //Someone else moved his rank in the meantime. Leave it alone, but drop our row so
-        //MiniCore does not undo their change at the next login.
-        await query(client.mysqlingame, "DELETE FROM `temp_rank` WHERE `player` = ? AND `new` = ?", [player, conf.rank]);
-        outcome = "superseded";
-    }
+    //The account we actually granted to, NOT whatever is linked right now: after an account
+    //change those differ, and acting on the new one would strip a rank we never posted.
+    let player = row.player;
+    let outcome = await releaseTempRank(client, player, row.old_rank || defaultRank());
 
     await query(client.mysqldiscord, "DELETE FROM `boosterRank` WHERE `user` = ?", [userId]);
     notified.delete(userId);
@@ -483,14 +502,14 @@ async function sweepRoles(client) {
             let player = await linkedPlayer(client, row.user);
             if (player) continue;
 
-            let roles = await grantedRoles(client, row.user);
-            let removed = await removeRoles(client, row.user, roles, "Compte de jeu delie");
-            await forgetRoles(client, row.user);
+            let granted = await grantedRoles(client, row.user);
+            let roles = await removeRoles(client, row.user, granted, "Compte de jeu delie");
+            await forgetRoles(client, row.user, roles.failed);
             await quiet(query(client.mysqldiscord, "DELETE FROM `tempRank` WHERE `user` = ?", [row.user]),
                 "Nettoyage de tempRank pour " + row.user);
 
-            if (removed.length) {
-                log(client, "<@" + row.user + "> n'est plus lie a un compte de jeu, " + removed.length + " role(s) de grade retire(s)");
+            if (roles.removed.length) {
+                log(client, "<@" + row.user + "> n'est plus lie a un compte de jeu, " + roles.removed.length + " role(s) de grade retire(s)");
             }
         } catch (err) {
             console.error("Reconciliation des roles de " + row.user + " : " + err);
@@ -506,8 +525,19 @@ async function sweepBoosters(client, members) {
         for (const row of rows) {
             try {
                 let member = members.get(row.user);
-                if (member && member.premiumSince) continue;
-                await revokeBooster(client, row.user, member ? "Fin du boost" : "Membre parti du serveur");
+                if (!member) {
+                    await revokeBooster(client, row.user, "Membre parti du serveur");
+                    continue;
+                }
+                if (!member.premiumSince) {
+                    await revokeBooster(client, row.user, "Fin du boost");
+                    continue;
+                }
+                //Still boosting is not enough. The account may have unlinked in game, which
+                //the bot is never told about, and the sibling pass above has already taken
+                //his discord roles back for exactly that reason.
+                let player = await linkedPlayer(client, row.user);
+                if (!player) await revokeBooster(client, row.user, "Compte de jeu delie");
             } catch (err) {
                 console.error("Retrait du grade booster de " + row.user + " : " + err);
             }
